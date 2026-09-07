@@ -16,6 +16,52 @@ function wikiFileStem(name: string): string {
   return name.replace(/\.md$/i, "");
 }
 
+function uniqueWikiPagesSortedByPath(pages: WikiPageListItem[]): WikiPageListItem[] {
+  return pages
+    .filter((candidate, index, all) => {
+      return all.findIndex((entry) => entry.path === candidate.path) === index;
+    })
+    .slice()
+    .sort((left, right) => left.path.localeCompare(right.path));
+}
+
+/**
+ * Remaining wiki pages after a delete.
+ *
+ * Uses the remaining-page list returned by the delete response. The deleted
+ * path is excluded if it is still present in that list.
+ */
+export function leftoverWikiPagesAfterDelete(
+  deletedPath: string,
+  remainingPages: WikiPageListItem[]
+): WikiPageListItem[] {
+  return uniqueWikiPagesSortedByPath(remainingPages).filter((candidate) => {
+    return candidate.path !== deletedPath;
+  });
+}
+
+/**
+ * Wiki path to open after deleting a page.
+ *
+ * Opens the next remaining page after the deleted path. If the deleted page
+ * was last, opens the previous remaining page. If none remain, opens the
+ * wiki home directory.
+ */
+export function wikiPageToOpenAfterDelete(
+  deletedPath: string,
+  remainingPages: WikiPageListItem[]
+): string {
+  const leftoverPages = leftoverWikiPagesAfterDelete(deletedPath, remainingPages);
+  if (leftoverPages.length === 0) {
+    return "";
+  }
+  const nextPage = leftoverPages.find((page) => page.path > deletedPath);
+  if (nextPage) {
+    return nextPage.path;
+  }
+  return leftoverPages[leftoverPages.length - 1].path;
+}
+
 export function resolveWikiRoute(pages: WikiPageListItem[], route: string): WikiRouteResult {
   const normalizedRoute = route.replace(/^\/+/, "").replace(/\/+$/, "");
   const pagePaths = pages.map((page) => page.path);

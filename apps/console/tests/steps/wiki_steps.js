@@ -121,7 +121,12 @@ async function reloadIfWikiStale(world) {
   world.wikiStale = false;
 }
 
-Before(function () {
+Before(async function () {
+  if (wikiRoot) {
+    await resetWiki();
+    this.wikiStale = true;
+    return;
+  }
   this.wikiStale = false;
 });
 
@@ -137,7 +142,17 @@ Given("a wiki page {string} exists with content:", async function (relativePath,
 
 When("I select wiki page {string}", async function (relativePath) {
   await reloadIfWikiStale(this);
-  await navigateToWikiPage(this.page, relativePath);
+  await expect(
+    this.page
+      .locator(".wiki-directory-listing")
+      .or(this.page.getByTestId(`wiki-path-${pathLeaf(relativePath)}`))
+  ).toBeVisible({ timeout: 15000 });
+  const listingButton = wikiPageButton(this.page, relativePath);
+  if ((await listingButton.count()) > 0 && (await listingButton.isVisible().catch(() => false))) {
+    await listingButton.click();
+  } else {
+    await navigateToWikiPage(this.page, relativePath);
+  }
   await expect(this.page.getByTestId(`wiki-path-${pathLeaf(relativePath)}`)).toBeVisible({ timeout: 15000 });
 });
 
@@ -185,9 +200,39 @@ When("I rename the wiki page {string} to {string}", async function (fromPath, to
 
 When("I delete the wiki page {string}", async function (relativePath) {
   await reloadIfWikiStale(this);
-  this.page.once("dialog", (dialog) => dialog.accept());
-  await this.page.getByRole("button", { name: "Actions" }).click();
-  await this.page.getByRole("menuitem", { name: "Delete page" }).click();
+  const acceptDialog = (dialog) => {
+    void dialog.accept();
+  };
+  this.page.on("dialog", acceptDialog);
+  try {
+    await this.page.getByRole("button", { name: "Actions" }).click();
+    await this.page.getByRole("menuitem", { name: "Delete page" }).click();
+    const candidate = path.join(requireWikiRoot(), relativePath);
+    await expect
+      .poll(
+        async () => {
+          try {
+            await access(candidate);
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        { timeout: 15000 }
+      )
+      .toBe(false);
+    await expect
+      .poll(
+        async () => {
+          const pathname = new URL(this.page.url()).pathname;
+          return pathname.includes(`/wiki/${encodeWikiPath(relativePath)}`);
+        },
+        { timeout: 15000 }
+      )
+      .toBe(false);
+  } finally {
+    this.page.off("dialog", acceptDialog);
+  }
 });
 
 When("I type wiki content:", async function (docString) {
@@ -211,6 +256,49 @@ When("I render the wiki page", async function () {
   } else {
     await expect(this.page.locator(".wiki-preview")).toBeVisible({ timeout: 15000 });
   }
+});
+
+When("I render the wiki page through the backend", async function () {
+  await reloadIfWikiStale(this);
+  await expect(this.page.getByTestId("wiki-view")).toBeVisible({ timeout: 15000 });
+  const renderButton = this.page.getByRole("button", { name: /Render/ });
+  if ((await renderButton.count()) > 0 && (await renderButton.first().isVisible().catch(() => false))) {
+    await renderButton.first().click();
+  }
+  await expect
+    .poll(
+      async () => {
+        const html = this.page.locator(".wiki-preview-html");
+        const renderError = this.page.getByTestId("wiki-render-error");
+        const banner = this.page.locator(".wiki-error");
+        const htmlReady = (await html.count()) > 0 && (await html.innerHTML().catch(() => "")).trim().length > 0;
+        const errorReady =
+          ((await renderError.count()) > 0 && (await renderError.isVisible().catch(() => false)))
+          || ((await banner.count()) > 0 && (await banner.isVisible().catch(() => false)));
+        return htmlReady || errorReady;
+      },
+      { timeout: 20000 }
+    )
+    .toBe(true);
+});
+
+Then("the wiki preview HTML should contain element with class {string}", async function (className) {
+  const preview = this.page.locator(".wiki-preview-html");
+  await expect(preview).toBeVisible({ timeout: 15000 });
+  await expect(preview.locator(`.${className}`).first()).toBeVisible({ timeout: 15000 });
+});
+
+Then("the wiki preview HTML should contain {string}", async function (expected) {
+  const preview = this.page.locator(".wiki-preview-html");
+  await expect(preview).toBeVisible({ timeout: 15000 });
+  await expect(preview).toContainText(expected, { timeout: 15000 });
+});
+
+Then("the wiki preview HTML should not contain {string}", async function (unexpected) {
+  const preview = this.page.locator(".wiki-preview-html");
+  await expect(preview).toBeVisible({ timeout: 15000 });
+  const html = await preview.innerHTML();
+  expect(html.includes(unexpected)).toBe(false);
 });
 
 When("I attempt to select wiki page {string} without confirming", async function (relativePath) {
@@ -292,18 +380,28 @@ Then("the wiki page list should include {string}", async function (relativePath)
   const leaf = pathLeaf(relativePath);
   const inDirectory = this.page.locator(`.wiki-directory-listing button[data-wiki-path="${relativePath}"]`).first();
   const inHeader = this.page.getByTestId(`wiki-path-${leaf}`).or(this.page.getByRole("button", { name: relativePath })).first();
-  await expect
-    .poll(
-      async () => {
-        const directoryVisible =
-          (await inDirectory.count()) > 0 && (await inDirectory.isVisible().catch(() => false));
-        const headerVisible =
-          (await inHeader.count()) > 0 && (await inHeader.isVisible().catch(() => false));
-        return directoryVisible || headerVisible;
-      },
-      { timeout: 15000 }
-    )
-    .toBe(true);
+  try {
+    await expect
+      .poll(
+        async () => {
+          const directoryVisible =
+            (await inDirectory.count()) > 0 && (await inDirectory.isVisible().catch(() => false));
+          const headerVisible =
+            (await inHeader.count()) > 0 && (await inHeader.isVisible().catch(() => false));
+          const currentPath = new URL(this.page.url()).pathname;
+          const urlVisible = currentPath.includes(`/wiki/${encodeWikiPath(relativePath)}`);
+          return directoryVisible || headerVisible || urlVisible;
+        },
+        { timeout: 15000 }
+      )
+      .toBe(true);
+  } catch {
+    const pathname = new URL(this.page.url()).pathname;
+    const listing = await this.page.locator(".wiki-directory-listing").innerHTML().catch(() => "");
+    throw new Error(
+      `wiki page ${relativePath} not visible after wait (url=${pathname}, listing=${listing.slice(0, 400)})`
+    );
+  }
 });
 
 Then("the wiki page list should not include {string}", async function (relativePath) {

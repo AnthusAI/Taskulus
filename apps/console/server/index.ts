@@ -498,7 +498,7 @@ async function wikiRenderPage(relativePagePath: string): Promise<WikiCliRenderRe
 
 const wikiRateLimit = rateLimit({
   windowMs: 60_000,
-  max: 120,
+  max: 600,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "rate limit exceeded" }
@@ -622,7 +622,13 @@ apiRouter.delete("/wiki/page", wikiRateLimit, async (req, res) => {
       return;
     }
     await fsPromises.unlink(absolute);
-    res.json({ path: normalized, deleted: true });
+    const remaining = await listWikiPages();
+    res.json({
+      path: normalized,
+      deleted: true,
+      pages: remaining.pages,
+      wiki_directory_exists: remaining.wiki_directory_exists
+    });
   } catch (error) {
     const message = (error as Error).message;
     if (message === "invalid wiki path" || message === "wiki path must end with .md") {
