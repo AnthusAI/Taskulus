@@ -165,7 +165,9 @@ fn board_type_filter_from_selected_tab(selected: &str) -> &'static str {
     }
 }
 
-fn collect_workflow_statuses(workflow: &std::collections::BTreeMap<String, Vec<String>>) -> HashSet<String> {
+fn collect_workflow_statuses(
+    workflow: &std::collections::BTreeMap<String, Vec<String>>,
+) -> HashSet<String> {
     let mut statuses: HashSet<String> = workflow.keys().cloned().collect();
     for transitions in workflow.values() {
         for target in transitions {
@@ -246,11 +248,8 @@ fn board_column_labels(world: &mut KanbusWorld) -> Vec<String> {
             .map(|status| status.name.clone())
             .collect();
     }
-    let issue_types = issue_types_for_board_filter(
-        board_filter,
-        &configuration.hierarchy,
-        &configuration.types,
-    );
+    let issue_types =
+        issue_types_for_board_filter(board_filter, &configuration.hierarchy, &configuration.types);
     let mut status_keys = HashSet::new();
     for issue_type in issue_types {
         let workflow = get_workflow_for_issue_type(&configuration, &issue_type)
@@ -1043,6 +1042,22 @@ fn when_switch_metrics_view(world: &mut KanbusWorld, view: String) {
 fn then_board_view_active(world: &mut KanbusWorld) {
     let state = require_console_state(world);
     assert_eq!(state.panel_mode, "board");
+}
+
+#[then("the console board should be visible")]
+fn then_console_board_is_visible(world: &mut KanbusWorld) {
+    let state = require_console_state(world);
+    assert_eq!(state.panel_mode, "board");
+    let app_source =
+        std::fs::read_to_string(console_app_root().join("src/App.tsx")).expect("read App.tsx");
+    assert!(
+        app_source.contains("data-testid=\"board-view\""),
+        "App.tsx must expose board-view"
+    );
+    assert!(
+        app_source.contains("data-testid=\"open-settings\""),
+        "App.tsx must expose open-settings"
+    );
 }
 
 #[then("the board view should be inactive")]

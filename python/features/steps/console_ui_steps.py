@@ -402,9 +402,7 @@ def _issue_types_for_board_filter_key(
     excluded = {"initiative", "epic", "sub-task"}
     from_hierarchy = [entry for entry in hierarchy if entry not in excluded]
     from_types = [
-        entry
-        for entry in types
-        if entry not in excluded and entry not in hierarchy_set
+        entry for entry in types if entry not in excluded and entry not in hierarchy_set
     ]
     return list(dict.fromkeys([*from_hierarchy, *from_types]))
 
@@ -1251,6 +1249,19 @@ def then_board_view_active(context: object) -> None:
     state = _require_console_state(context)
     if state.panel_mode != "board":
         raise AssertionError(f"expected board view, got {state.panel_mode}")
+
+
+@then("the console board should be visible")
+def then_console_board_is_visible(context: object) -> None:
+    """Verify the board shell remains rendered after route reload."""
+    state = _require_console_state(context)
+    if state.panel_mode != "board":
+        raise AssertionError(f"expected board panel mode, got {state.panel_mode}")
+    app_source = (_console_app_root() / "src" / "App.tsx").read_text()
+    if 'data-testid="board-view"' not in app_source:
+        raise AssertionError("App.tsx must expose board-view")
+    if 'data-testid="open-settings"' not in app_source:
+        raise AssertionError("App.tsx must expose open-settings")
 
 
 @then("the board view should be inactive")

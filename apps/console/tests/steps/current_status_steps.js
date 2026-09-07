@@ -147,12 +147,16 @@ Then("the current status view should be active", async function () {
   await expect(this.page.getByTestId("current-status-view")).toBeVisible();
 });
 
+function typeFilterSelectorLocator(page) {
+  return page.locator('[data-selector="view"][role="tablist"]');
+}
+
 Then("the type filter selector should be hidden", async function () {
-  await expect(this.page.locator('[data-selector="view"]')).toHaveCount(0);
+  await expect(typeFilterSelectorLocator(this.page)).toHaveCount(0);
 });
 
 Then("the type filter selector should be visible", async function () {
-  await expect(this.page.locator('[data-selector="view"]')).toBeVisible();
+  await expect(typeFilterSelectorLocator(this.page)).toBeVisible();
 });
 
 Then("the status tree node for {string} should be expandable", async function (title) {
@@ -196,10 +200,6 @@ Then("the status tree view should be enabled", async function () {
 });
 
 When("I select the now status filter {string}", async function (status) {
-  await this.page.getByTestId("now-status-filter").selectOption(status);
-});
-
-Given("I select the now status filter {string}", async function (status) {
   await this.page.getByTestId("now-status-filter").selectOption(status);
 });
 
@@ -343,11 +343,6 @@ When("I disable the status tree view", async function () {
   await expect(this.page.getByTestId("status-feed")).toBeVisible();
 });
 
-Given("I disable the status tree view", async function () {
-  await this.page.getByTestId("status-tree-toggle").uncheck();
-  await expect(this.page.getByTestId("status-feed")).toBeVisible();
-});
-
 When("I collapse the status tree node for {string}", async function (title) {
   await treeRow(this.page, title).getByTestId("status-tree-node-toggle").click();
 });
@@ -388,6 +383,10 @@ When(
     issue.right_now_summary = summary;
     issue.right_now_updated_at = issue.updated_at ?? issue.created_at;
     await writeStatusIssue(issue);
+    await waitForIssueField(
+      issue.id,
+      (entry) => entry.right_now_summary === summary
+    );
     await expect
       .poll(async () => feedRow(this.page, title).getByTestId("status-feed-summary").textContent(), {
         timeout: 8000
