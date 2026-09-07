@@ -109,7 +109,7 @@ app.use(
 );
 
 let cachedSnapshot: IssuesSnapshot | null = null;
-let snapshotPromise: Promise<IssuesSnapshot> | null = null;
+let snapshotRefreshTail: Promise<IssuesSnapshot> | null = null;
 
 function logConsoleEvent(
   label: string,
@@ -144,23 +144,34 @@ async function getSnapshot(): Promise<IssuesSnapshot> {
   if (cachedSnapshot) {
     return cachedSnapshot;
   }
-  if (!snapshotPromise) {
-    snapshotPromise = runSnapshot()
-      .then((snapshot) => {
-        cachedSnapshot = snapshot;
-        return snapshot;
-      })
-      .finally(() => {
-        snapshotPromise = null;
-      });
-  }
-  return snapshotPromise;
+  return refreshSnapshot();
 }
 
+/*
+ * Snapshot CLI runs can overlap. A slower earlier run must not replace a
+ * newer cached snapshot or broadcast stale issues and config over SSE.
+ */
 async function refreshSnapshot(): Promise<IssuesSnapshot> {
-  const snapshot = await runSnapshot();
-  cachedSnapshot = snapshot;
-  return snapshot;
+  const predecessor = snapshotRefreshTail;
+  const current = (async () => {
+    if (predecessor) {
+      try {
+        await predecessor;
+      } catch {
+      }
+    }
+    const snapshot = await runSnapshot();
+    cachedSnapshot = snapshot;
+    return snapshot;
+  })();
+  snapshotRefreshTail = current;
+  try {
+    return await current;
+  } finally {
+    if (snapshotRefreshTail === current) {
+      snapshotRefreshTail = null;
+    }
+  }
 }
 
 function shouldRefreshSnapshot(
@@ -243,8 +254,20 @@ apiRouter.get("/issues/:id", async (req, res) => {
   }
 });
 
-const sseClients = new Set<express.Response>();
+const snapshotSseClients = new Set<express.Response>();
+const realtimeSseClients = new Set<express.Response>();
 const telemetryClients = new Set<express.Response>();
+
+function writeSsePayload(clients: Set<express.Response>, payload: string): void {
+  for (const client of clients) {
+    try {
+      if (!client.writableEnded) {
+        client.write(payload);
+      }
+    } catch {
+    }
+  }
+}
 
 function openSseStream(
   req: express.Request,
@@ -252,8 +275,9 @@ function openSseStream(
   onClose: () => void
 ): void {
   res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
   res.flushHeaders();
   res.write("retry: 3000\n\n");
   const heartbeat = setInterval(() => {
@@ -268,12 +292,12 @@ function openSseStream(
 }
 
 apiRouter.get("/events", async (req, res) => {
-  sseClients.add(res);
+  snapshotSseClients.add(res);
   openSseStream(req, res, () => {
-    sseClients.delete(res);
-    logConsoleEvent("sse-client-disconnected", { clients: sseClients.size });
+    snapshotSseClients.delete(res);
+    logConsoleEvent("sse-client-disconnected", { clients: snapshotSseClients.size });
   });
-  logConsoleEvent("sse-client-connected", { clients: sseClients.size });
+  logConsoleEvent("sse-client-connected", { clients: snapshotSseClients.size });
 
   try {
     const snapshot = await getSnapshot();
@@ -288,32 +312,19 @@ apiRouter.get("/events", async (req, res) => {
   }
 });
 
-// Realtime stream alias used by the web client.
 apiRouter.get("/events/realtime", async (req, res) => {
-  sseClients.add(res);
+  realtimeSseClients.add(res);
   openSseStream(req, res, () => {
-    sseClients.delete(res);
+    realtimeSseClients.delete(res);
     logConsoleEvent("sse-client-disconnected", {
-      clients: sseClients.size,
+      clients: realtimeSseClients.size,
       stream: "realtime"
     });
   });
   logConsoleEvent("sse-client-connected", {
-    clients: sseClients.size,
+    clients: realtimeSseClients.size,
     stream: "realtime"
   });
-
-  try {
-    const snapshot = await getSnapshot();
-    res.write(`data: ${JSON.stringify(snapshot)}\n\n`);
-  } catch (error) {
-    res.write(
-      `data: ${JSON.stringify({
-        error: (error as Error).message,
-        updated_at: new Date().toISOString()
-      })}\n\n`
-    );
-  }
 });
 
 apiRouter.get("/telemetry/console/events", (req, res) => {
@@ -736,10 +747,7 @@ app.use("/:account/:project/api", apiRouter);
 app.use("/api", apiRouter);
 
 function broadcastSnapshot(snapshot: IssuesSnapshot) {
-  const payload = `data: ${JSON.stringify(snapshot)}\n\n`;
-  for (const client of sseClients) {
-    client.write(payload);
-  }
+  writeSsePayload(snapshotSseClients, `data: ${JSON.stringify(snapshot)}\n\n`);
 }
 
 function broadcastTelemetry(payload: Record<string, unknown>) {
@@ -774,20 +782,19 @@ watcher.on("all", (eventName, filePath) => {
       broadcastSnapshot(snapshot);
       logConsoleEvent("snapshot-broadcast", {
         durationMs: Date.now() - refreshStartedAt,
-        clients: sseClients.size
+        clients: snapshotSseClients.size
       });
     } catch (error) {
-      const payload = {
-        error: (error as Error).message,
-        updated_at: new Date().toISOString()
-      };
-      const message = `data: ${JSON.stringify(payload)}\n\n`;
-      for (const client of sseClients) {
-        client.write(message);
-      }
+      writeSsePayload(
+        snapshotSseClients,
+        `data: ${JSON.stringify({
+          error: (error as Error).message,
+          updated_at: new Date().toISOString()
+        })}\n\n`
+      );
       logConsoleEvent("snapshot-error", {
         durationMs: Date.now() - refreshStartedAt,
-        clients: sseClients.size,
+        clients: snapshotSseClients.size,
         error: (error as Error).message
       });
     }
