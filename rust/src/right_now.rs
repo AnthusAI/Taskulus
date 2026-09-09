@@ -343,14 +343,26 @@ pub fn persist_right_now_summary(
     updated_at: chrono::DateTime<Utc>,
 ) -> Result<(), KanbusError> {
     let overlay_path = overlay_issue_path(project_dir, issue_identifier);
+    let canonical_path = project_dir
+        .join("issues")
+        .join(format!("{issue_identifier}.json"));
+    let canonical_issue = if canonical_path.exists() {
+        Some(read_issue_from_file(&canonical_path)?)
+    } else {
+        None
+    };
     if issue_path != overlay_path.as_path() && issue_path.exists() {
-        let mut stored_issue = read_issue_from_file(issue_path)?;
+        let mut stored_issue = if let Some(issue) = canonical_issue.clone() {
+            issue
+        } else {
+            read_issue_from_file(issue_path)?
+        };
         stored_issue.right_now_summary = Some(summary.to_string());
         stored_issue.right_now_updated_at = Some(updated_at);
         write_issue_to_file(&stored_issue, issue_path)?;
     }
     if let Some(overlay_record) = load_overlay_issue(project_dir, issue_identifier)? {
-        let mut overlay_issue = overlay_record.issue;
+        let mut overlay_issue = canonical_issue.unwrap_or(overlay_record.issue);
         overlay_issue.right_now_summary = Some(summary.to_string());
         overlay_issue.right_now_updated_at = Some(updated_at);
         write_overlay_issue(
@@ -383,12 +395,24 @@ pub fn regenerate_right_now_for_issue(root: &Path, issue_identifier: &str) {
         Ok(lookup) => lookup,
         Err(_) => return,
     };
+    let canonical_path = lookup
+        .project_dir
+        .join("issues")
+        .join(format!("{issue_identifier}.json"));
+    let issue = if canonical_path.exists() {
+        match read_issue_from_file(&canonical_path) {
+            Ok(issue) => issue,
+            Err(_) => lookup.issue,
+        }
+    } else {
+        lookup.issue
+    };
     let children = match load_child_issues(root, issue_identifier) {
         Ok(children) => children,
         Err(_) => return,
     };
-    let context = build_right_now_context(&lookup.issue, &children);
-    let summary = match generate_right_now_summary(root, &lookup.issue, &context) {
+    let context = build_right_now_context(&issue, &children);
+    let summary = match generate_right_now_summary(root, &issue, &context) {
         Ok(summary) => summary,
         Err(error) => {
             eprintln!("warning: right-now generation failed for {issue_identifier}: {error}");
@@ -515,7 +539,7 @@ pub fn ensure_right_now_summary_subtrees(
 ) {
     let mut memo = HashMap::new();
     for identifier in root_identifiers {
-        ensure_right_now_subtree(root, identifier, &selected_identifiers, &mut memo);
+        ensure_right_now_subtree(root, identifier, selected_identifiers, &mut memo);
     }
 }
 
@@ -742,10 +766,12 @@ pub fn project_events_directory(root: &Path) -> Result<PathBuf, KanbusError> {
 mod tests {
     use super::*;
     use crate::issue_files::{read_issue_from_file, write_issue_to_file};
+    use crate::issue_lookup::load_issue_from_project;
     use crate::models::IssueData;
     use crate::overlay::{load_overlay_issue, write_overlay_issue};
     use chrono::Utc;
-    use std::collections::BTreeMap;
+    use serial_test::serial;
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
 
     fn make_issue(id: &str, title: &str) -> IssueData {
@@ -903,5 +929,153 @@ mod tests {
     fn summary_contains_status_keyword_detects_bare_tokens() {
         assert!(summary_contains_status_keyword("Work is blocked on review"));
         assert!(!summary_contains_status_keyword("Agents keep shipping"));
+    }
+
+    #[test]
+    fn resolve_child_summary_uses_full_summary_when_right_now_is_absent() {
+        let mut issue = make_issue("kanbus-full", "Full child");
+        issue.description = "Detailed body".to_string();
+        issue.comments.push(crate::models::IssueComment {
+            id: Some("abc12345".to_string()),
+            author: "dev".to_string(),
+            text: Some("working on it".to_string()),
+            created_at: Utc::now(),
+            comment_type: "default".to_string(),
+            data: BTreeMap::new(),
+            agent: None,
+        });
+        let rendered = resolve_child_summary(&issue);
+        assert!(rendered.contains("Title: Full child"));
+        assert!(rendered.contains("working on it"));
+    }
+
+    #[test]
+    fn ensure_right_now_subtree_handles_child_listing_and_lookup_errors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let configuration = crate::config::default_project_configuration();
+        let yaml = serde_yaml::to_string(&configuration).expect("serialize config");
+        fs::write(temp.path().join(".kanbus.yml"), yaml).expect("write config");
+        fs::create_dir_all(temp.path().join("project/issues")).expect("mkdir");
+        let mut memo = HashMap::new();
+        assert!(!ensure_right_now_subtree(
+            temp.path(),
+            "kanbus-missing-root",
+            &HashSet::from(["kanbus-missing-root".to_string()]),
+            &mut memo,
+        ));
+        assert_eq!(memo.get("kanbus-missing-root"), Some(&false));
+    }
+
+    #[test]
+    fn ensure_right_now_subtree_uses_memo_for_repeated_visits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let configuration = crate::config::default_project_configuration();
+        let yaml = serde_yaml::to_string(&configuration).expect("serialize config");
+        fs::write(temp.path().join(".kanbus.yml"), yaml).expect("write config");
+        fs::create_dir_all(temp.path().join("project/issues")).expect("mkdir");
+        let issue = make_issue("kanbus-memo", "Memo issue");
+        write_issue_to_file(&issue, &temp.path().join("project/issues/kanbus-memo.json"))
+            .expect("write issue");
+        let selected = HashSet::from(["kanbus-memo".to_string()]);
+        let mut memo = HashMap::new();
+        memo.insert("kanbus-memo".to_string(), false);
+        assert!(!ensure_right_now_subtree(
+            temp.path(),
+            "kanbus-memo",
+            &selected,
+            &mut memo,
+        ));
+        assert_eq!(memo.get("kanbus-memo"), Some(&false));
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_right_now_subtree_generates_mock_summary_for_stale_issue() {
+        let previous_mock = std::env::var("KANBUS_TEST_AI_MOCK").ok();
+        std::env::set_var("KANBUS_TEST_AI_MOCK", "1");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut configuration = crate::config::default_project_configuration();
+        configuration.ai = Some(crate::models::AiConfiguration {
+            provider: "litellm".to_string(),
+            model: "gpt-4o-mini".to_string(),
+        });
+        configuration.right_now.enabled = true;
+        let yaml = serde_yaml::to_string(&configuration).expect("serialize config");
+        fs::write(temp.path().join(".kanbus.yml"), yaml).expect("write config");
+        fs::create_dir_all(temp.path().join("project/issues")).expect("mkdir");
+        let issue = make_issue("kanbus-stale", "Stale issue");
+        write_issue_to_file(
+            &issue,
+            &temp.path().join("project/issues/kanbus-stale.json"),
+        )
+        .expect("write issue");
+        let selected = HashSet::from(["kanbus-stale".to_string()]);
+        let mut memo = HashMap::new();
+        assert!(ensure_right_now_subtree(
+            temp.path(),
+            "kanbus-stale",
+            &selected,
+            &mut memo,
+        ));
+        let reloaded =
+            load_issue_from_project(temp.path(), "kanbus-stale").expect("reload stale issue");
+        assert_eq!(
+            reloaded.issue.right_now_summary.as_deref(),
+            Some("Mock right-now summary for kanbus-stale.")
+        );
+        match previous_mock {
+            Some(value) => std::env::set_var("KANBUS_TEST_AI_MOCK", value),
+            None => std::env::remove_var("KANBUS_TEST_AI_MOCK"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn generate_right_now_summary_uses_mock_and_right_now_model_override() {
+        let previous_mock = std::env::var("KANBUS_TEST_AI_MOCK").ok();
+        std::env::set_var("KANBUS_TEST_AI_MOCK", "1");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut configuration = crate::config::default_project_configuration();
+        configuration.ai = Some(crate::models::AiConfiguration {
+            provider: "litellm".to_string(),
+            model: "gpt-4o-mini".to_string(),
+        });
+        configuration.right_now.enabled = true;
+        configuration.right_now.model = Some("gpt-5.6-luna".to_string());
+        let yaml = serde_yaml::to_string(&configuration).expect("serialize config");
+        fs::write(temp.path().join(".kanbus.yml"), yaml).expect("write config");
+        fs::create_dir_all(temp.path().join("project/events")).expect("mkdir events");
+        let issue = make_issue("kanbus-model", "Model override");
+        let summary =
+            generate_right_now_summary(temp.path(), &issue, &build_right_now_context(&issue, &[]))
+                .expect("generate summary");
+        assert_eq!(summary, "Mock right-now summary for kanbus-model.");
+        match previous_mock {
+            Some(value) => std::env::set_var("KANBUS_TEST_AI_MOCK", value),
+            None => std::env::remove_var("KANBUS_TEST_AI_MOCK"),
+        }
+    }
+
+    #[test]
+    fn persist_right_now_summary_reads_issue_path_when_canonical_is_missing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("project");
+        let issue_path = project_dir.join("issues/kanbus-path-only.json");
+        fs::create_dir_all(issue_path.parent().expect("parent")).expect("mkdir");
+        let issue = make_issue("kanbus-path-only", "Path only");
+        write_issue_to_file(&issue, &issue_path).expect("write issue");
+        persist_right_now_summary(
+            &project_dir,
+            &issue_path,
+            "kanbus-path-only",
+            "Path-only summary.",
+            Utc::now(),
+        )
+        .expect("persist");
+        let stored = read_issue_from_file(&issue_path).expect("read issue");
+        assert_eq!(
+            stored.right_now_summary.as_deref(),
+            Some("Path-only summary.")
+        );
     }
 }
