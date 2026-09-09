@@ -39,8 +39,6 @@ Feature: Console board screenshot
     And the screenshot appearance mode should be "dark"
 
   Scenario: Screenshot command rejects invalid appearance mode
-    Given the console server is running
-    And screenshot capture is mocked to succeed
     When I run "kanbus console screenshot --mode sepia"
     Then the command should fail with exit code 1
     And stderr should contain "appearance mode must be light or dark"
@@ -112,8 +110,6 @@ Feature: Console board screenshot
     And screenshot capture expand-all should be enabled
 
   Scenario: Screenshot command rejects invalid view
-    Given the console server is running
-    And screenshot capture is mocked to succeed
     When I run "kanbus console screenshot --view pods"
     Then the command should fail with exit code 1
     And stderr should contain "view must be one of"
