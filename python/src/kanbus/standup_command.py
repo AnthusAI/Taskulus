@@ -190,6 +190,7 @@ def run_standup_command(root: Path, options: StandupCommandOptions) -> str:
     }
     report_time = resolve_standup_report_time()
     report = build_standup_report(
+        root,
         profile,
         issues,
         right_now_texts,
